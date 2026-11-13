@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyiceberg-drift"
+version = "0.1.0"
+description = "A lightweight CLI tool to detect data drift between Apache Iceberg snapshots."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyiceberg[sql-sqlite]>=0.6.0",
+    "pandas>=2.0.0",
+    "scipy>=1.10.0",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+pyiceberg-drift = "cli:check_drift"
+
+# Добавьте эту секцию:
+[tool.setuptools]
+py-modules = ["cli", "drift_detector"]

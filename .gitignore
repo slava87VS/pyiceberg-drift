@@ -1,0 +1,22 @@
+# PyCharm / IDE
+.idea/
+*.iml
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Локальные данные Iceberg и базы данных
+warehouse/
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Окружение и кэш
+.env
+.pytest_cache/
+
+*.egg-info/
