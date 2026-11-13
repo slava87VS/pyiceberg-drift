@@ -16,8 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-pyiceberg-drift = "cli:check_drift"
+pyiceberg-drift = "pyiceberg_drift.cli:check_drift"
 
-# Добавьте эту секцию:
 [tool.setuptools]
-py-modules = ["cli", "drift_detector"]
+packages = ["pyiceberg_drift"]

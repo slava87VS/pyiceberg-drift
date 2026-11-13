@@ -3,7 +3,7 @@ import shutil
 import json
 import pyarrow as pa
 from pyiceberg.catalog.sql import SqlCatalog
-from drift_detector import DriftDetector
+from pyiceberg_drift.drift_detector import DriftDetector
 
 
 def create_dummy_table():
