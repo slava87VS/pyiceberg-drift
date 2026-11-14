@@ -5,6 +5,126 @@ from .drift_detector import DriftDetector
 from pyiceberg.catalog import load_catalog
 import datetime
 
+def get_snapshot_summary(spark, table_name: str):
+    """Собирает базовую статистику по последнему снапшоту."""
+    # Убрали MIN(committed_at), так как в .files этого поля нет
+    summary = spark.sql(f"""
+        SELECT 
+            COUNT(*) as file_count,
+            SUM(file_size_in_bytes) as total_bytes,
+            SUM(record_count) as total_rows
+        FROM {table_name}.files
+    """).collect()[0]
+
+    # Если размер меньше 1 МБ, показываем в КБ
+    total_bytes = summary['total_bytes'] if summary['total_bytes'] else 0
+    if total_bytes > 1024 * 1024:
+        size_str = f"{round(total_bytes / (1024 * 1024), 2)} MB"
+    else:
+        size_str = f"{round(total_bytes / 1024, 2)} KB"
+
+    return {
+        "file_count": summary['file_count'],
+        "size_str": size_str,
+        "total_rows": summary['total_rows'] if summary['total_rows'] else 0
+    }
+
+def generate_dashboard(results: list, snapshot_summary: dict = None, filename: str = "drift_dashboard.html"):
+    rows = ""
+    for r in results:
+        status_color = "#f8d7da" if r.get('is_drift') else "#d4edda"
+        status_text = "🚨 Дрейф" if r.get('is_drift') else "✅ Стабильно"
+
+        # Формируем детали
+        details = ""
+        if r.get('type') == 'numeric':
+            details = f"Среднее: {r.get('mean_prev', 0):.2f} -> {r.get('mean_curr', 0):.2f}"
+        elif r.get('type') == 'categorical':
+            details = "Распределение изменилось" if r.get('is_drift') else "Без изменений"
+        elif r.get('type') == 'null_count_zero_scan':
+            details = f"NULL: {r.get('nulls_prev')} -> {r.get('nulls_curr')}"
+        elif r.get('type') == 'bounds_zero_scan':
+            details = f"Min: {r.get('min_prev')} -> {r.get('min_curr')}, Max: {r.get('max_prev')} -> {r.get('max_curr')}"
+
+        p_val = f"{r.get('p_value', 0):.4f}" if r.get('p_value') is not None else "—"
+
+        rows += f"""
+        <tr>
+            <td><strong>{r['column']}</strong></td>
+            <td>{r['type']}</td>
+            <td>{p_val}</td>
+            <td>{details}</td>
+            <td style="background-color: {status_color}; font-weight: bold; text-align: center;">{status_text}</td>
+        </tr>
+        """
+
+    summary_html = ""
+    if snapshot_summary:
+        summary_html = f"""
+        <div class="summary-cards">
+            <div class="card">
+                <div class="card-value">{snapshot_summary['file_count']}</div>
+                <div class="card-label">Файлов</div>
+            </div>
+            <div class="card">
+                <div class="card-value">{snapshot_summary['size_str']}</div>
+                <div class="card-label">Общий размер</div>
+            </div>
+            <div class="card">
+                <div class="card-value">{snapshot_summary['total_rows']:,}</div>
+                <div class="card-label">Строк</div>
+            </div>
+        </div>
+        """
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="ru">
+    <head>
+        <meta charset="UTF-8">
+        <title>Drift Dashboard</title>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background-color: #f0f2f5; }}
+            h1 {{ color: #1a1a2e; margin-bottom: 10px; }}
+            .subtitle {{ color: #666; margin-bottom: 30px; }}
+            .summary-cards {{ display: flex; gap: 20px; margin-bottom: 30px; }}
+            .card {{ background: white; padding: 20px 30px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; flex: 1; max-width: 200px; }}
+            .card-value {{ font-size: 28px; font-weight: bold; color: #16213e; }}
+            .card-label {{ font-size: 13px; color: #888; margin-top: 5px; text-transform: uppercase; letter-spacing: 0.5px; }}
+            table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+            th {{ background-color: #16213e; color: white; padding: 14px; text-align: left; font-weight: 500; }}
+            td {{ padding: 14px; border-bottom: 1px solid #eee; vertical-align: top; }}
+            tr:last-child td {{ border-bottom: none; }}
+            tr:hover {{ background-color: #f8f9fa; }}
+        </style>
+    </head>
+    <body>
+        <h1>🔍 Drift Detection Dashboard</h1>
+        <div class="subtitle">Результаты zero-scan и сканирующих проверок</div>
+
+        {summary_html}
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Колонка</th>
+                    <th>Тип проверки</th>
+                    <th>p-value</th>
+                    <th>Детали</th>
+                    <th>Статус</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
+
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(html_content)
+    print(f"\nДашборд сохранен: {filename}")
 
 def list_snapshots(spark, table_name: str):
     """
@@ -343,4 +463,45 @@ def check_null_drift_zero_scan(
         "is_drift": is_drift,
         "p_value": None,  # Для zero-scan нет p-value, есть только изменение
         "stat": None
+    }
+
+
+def check_bounds_drift_zero_scan(spark, table_name: str, column_name: str, threshold_pct: float = 0.5, **kwargs):
+    snapshots_df = spark.sql(f"SELECT snapshot_id FROM {table_name}.snapshots ORDER BY committed_at ASC")
+    snapshots = snapshots_df.collect()
+    first_id, last_id = snapshots[0]['snapshot_id'], snapshots[-1]['snapshot_id']
+
+    def get_bounds(snapshot_id):
+        files_df = spark.read.format("iceberg").option("snapshot-id", snapshot_id).load(f"{table_name}.files")
+        files_df.createOrReplaceTempView("current_files_bounds")
+
+        # Получаем ID колонки
+        table_schema = spark.table(table_name).schema
+        field_id = next((idx + 1 for idx, field in enumerate(table_schema.fields) if field.name == column_name), None)
+
+        if field_id is None:
+            raise ValueError(f"Колонка {column_name} не найдена")
+
+        # Берем HEX-представление границ
+        res = spark.sql(f"""
+            SELECT 
+                MIN(HEX(lower_bounds[{field_id}])) as min_hex,
+                MAX(HEX(upper_bounds[{field_id}])) as max_hex
+            FROM current_files_bounds
+        """).collect()[0]
+
+        return res['min_hex'], res['max_hex']
+
+    min_prev, max_prev = get_bounds(first_id)
+    min_curr, max_curr = get_bounds(last_id)
+
+    is_drift = (min_prev != min_curr) or (max_prev != max_curr)
+
+    return {
+        "column": column_name,
+        "type": "bounds_zero_scan",
+        "min_prev": min_prev, "min_curr": min_curr,
+        "max_prev": max_prev, "max_curr": max_curr,
+        "is_drift": is_drift,
+        "details": "Границы изменились (HEX)" if is_drift else "Без изменений"
     }
