@@ -20,3 +20,13 @@ __pycache__/
 .pytest_cache/
 
 *.egg-info/
+
+# Spark test artifacts
+spark_warehouse/
+.metastore_db/
+derby.log
+*.log
+
+# Временные тестовые скрипты
+test_spark.py
+test_library.py
