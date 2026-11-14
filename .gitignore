@@ -30,3 +30,9 @@ derby.log
 # Временные тестовые скрипты
 test_spark.py
 test_library.py
+
+
+# Generated reports
+*.html
+drift_report*.html
+summary_drift_report.html
