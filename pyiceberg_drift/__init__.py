@@ -1,4 +1,5 @@
 import datetime
+import json
 from rich.console import Console
 from rich.table import Table
 from .drift_detector import DriftDetector
@@ -27,16 +28,14 @@ def list_snapshots(spark, table_name: str):
     for row in snapshots:
         dt = row['committed_at']
         dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if hasattr(dt, 'strftime') else str(dt)
-
-        # Достаем количество добавленных строк из summary (если есть)
         added_rows = row['summary'].get('added-records', '—')
-
         table.add_row(str(row['snapshot_id']), dt_str, row['operation'], str(added_rows))
 
     console.print("\n")
     console.print(table)
     console.print("\n")
     return snapshots
+
 
 def get_table_statistics(spark, table_name: str):
     """
@@ -77,7 +76,6 @@ def get_column_null_stats(spark, table_name: str, column_name: str):
     """
     try:
         table_schema = spark.table(table_name).schema
-        # Находим ID колонки (порядковый номер)
         field_id = next((idx + 1 for idx, field in enumerate(table_schema.fields) if field.name == column_name), None)
 
         if field_id is None:
@@ -93,14 +91,72 @@ def get_column_null_stats(spark, table_name: str, column_name: str):
         return 0
 
 
+def get_snapshot_history(spark, table_name: str):
+    """
+    Собирает историческую статистику по каждому снапшоту.
+    """
+    try:
+        snapshots_df = spark.sql(f"""
+            SELECT snapshot_id, committed_at, operation 
+            FROM {table_name}.snapshots 
+            ORDER BY committed_at ASC
+        """)
+        snapshots = snapshots_df.collect()
+
+        history = []
+        for snap in snapshots:
+            snap_id = snap['snapshot_id']
+            dt = snap['committed_at']
+
+            stats = spark.sql(f"""
+                SELECT 
+                    COUNT(*) as file_count,
+                    SUM(file_size_in_bytes) as total_bytes,
+                    SUM(record_count) as total_rows
+                FROM {table_name}.files VERSION AS OF {snap_id}
+            """).collect()[0]
+
+            total_bytes = stats['total_bytes'] if stats['total_bytes'] else 0
+
+            history.append({
+                "snapshot_id": snap_id,
+                "date": dt.strftime("%Y-%m-%d %H:%M") if hasattr(dt, 'strftime') else str(dt),
+                "operation": snap['operation'],
+                "files": stats['file_count'],
+                "size_mb": round(total_bytes / (1024 * 1024), 2),
+                "rows": stats['total_rows'] if stats['total_rows'] else 0
+            })
+
+        return history
+    except Exception as e:
+        print(f"❌ Ошибка при сборе истории снапшотов: {e}")
+        return []
+
+
+def get_top_files(spark, table_name: str, limit: int = 5):
+    """
+    Возвращает список самых больших файлов в таблице.
+    """
+    try:
+        files_df = spark.sql(f"""
+            SELECT file_path, file_size_in_bytes, record_count
+            FROM {table_name}.files
+            ORDER BY file_size_in_bytes DESC
+            LIMIT {limit}
+        """)
+        return files_df.collect()
+    except Exception as e:
+        print(f"❌ Ошибка при получении топа файлов: {e}")
+        return []
+
+
 # ==========================================
 # БЛОК 2: АУДИТ ЗДОРОВЬЯ ТАБЛИЦЫ
 # ==========================================
 
 def audit_table_health(spark, table_name: str):
     """
-    Полный аудит метаданных Iceberg: файлы, снапшоты, манифесты, партиции.
-    Возвращает словарь с результатами и списком проблем.
+    Полный аудит метаданных Iceberg: файлы, снапшоты, манифесты.
     """
     console = Console()
     console.print(f"\n[bold cyan]🏥 Аудит здоровья таблицы: {table_name}[/bold cyan]\n")
@@ -183,34 +239,23 @@ def audit_table_health(spark, table_name: str):
 # ==========================================
 # БЛОК 3: ГЕНЕРАЦИЯ HTML-ОТЧЕТА
 # ==========================================
+
 def generate_full_report(table_name, stats: dict, snapshots: list, audit_result: dict, null_stats: dict = None,
-                         filename: str = "report.html"):
+                         history: list = None, top_files: list = None, filename: str = "report.html"):
     """
     Генерирует детальный HTML-отчет со всей статистикой, историей и аудитом.
     """
-    # 1. Блок карточек с общей статистикой
+    # 1. Карточки
     cards_html = f"""
     <div class="summary-cards">
-        <div class="card">
-            <div class="card-value">{stats.get('total_files', 0)}</div>
-            <div class="card-label">Файлов</div>
-        </div>
-        <div class="card">
-            <div class="card-value">{stats.get('size_str', '0')}</div>
-            <div class="card-label">Размер</div>
-        </div>
-        <div class="card">
-            <div class="card-value">{stats.get('total_rows', 0):,}</div>
-            <div class="card-label">Строк</div>
-        </div>
-        <div class="card">
-            <div class="card-value">{audit_result['summary'].get('snapshots', 0)}</div>
-            <div class="card-label">Снапшотов</div>
-        </div>
+        <div class="card"><div class="card-value">{stats.get('total_files', 0)}</div><div class="card-label">Файлов</div></div>
+        <div class="card"><div class="card-value">{stats.get('size_str', '0')}</div><div class="card-label">Размер</div></div>
+        <div class="card"><div class="card-value">{stats.get('total_rows', 0):,}</div><div class="card-label">Строк</div></div>
+        <div class="card"><div class="card-value">{audit_result['summary'].get('snapshots', 0)}</div><div class="card-label">Снапшотов</div></div>
     </div>
     """
 
-    # 2. Блок проблем
+    # 2. Проблемы
     if audit_result['issues']:
         issues_html = "<ul class='issues-list'>"
         for issue in audit_result['issues']:
@@ -219,7 +264,7 @@ def generate_full_report(table_name, stats: dict, snapshots: list, audit_result:
     else:
         issues_html = "<p class='success'>✅ Таблица здорова. Проблем не обнаружено.</p>"
 
-    # 3. Детализация по файлам (распределение размеров)
+    # 3. Распределение файлов
     dist = stats.get('file_distribution', {})
     files_dist_html = f"""
     <table>
@@ -232,27 +277,77 @@ def generate_full_report(table_name, stats: dict, snapshots: list, audit_result:
     </table>
     """
 
-    # 4. История снапшотов
+    # 4. Топ файлов
+    top_files_html = ""
+    if top_files:
+        rows = ""
+        for f in top_files:
+            size_kb = round(f['file_size_in_bytes'] / 1024, 2)
+            rows += f"<tr><td style='font-family: monospace; font-size: 12px;'>{f['file_path'][-60:]}</td><td>{size_kb} KB</td><td>{f['record_count']}</td></tr>"
+        top_files_html = f"""
+        <h2>📦 Топ-{len(top_files)} самых больших файлов</h2>
+        <table>
+            <thead><tr><th>Путь (окончание)</th><th>Размер</th><th>Строк</th></tr></thead>
+            <tbody>{rows}</tbody>
+        </table>
+        """
+
+    # 5. История снапшотов (таблица)
     snaps_rows = ""
     for s in snapshots:
         dt_str = s['committed_at'].strftime("%Y-%m-%d %H:%M:%S") if hasattr(s['committed_at'], 'strftime') else str(
             s['committed_at'])
         added = s['summary'].get('added-records', '—')
-        snaps_rows += f"""
-        <tr>
-            <td style="font-family: monospace;">{s['snapshot_id']}</td>
-            <td>{dt_str}</td>
-            <td>{s['operation']}</td>
-            <td>{added}</td>
-        </tr>
+        snaps_rows += f"<tr><td style='font-family: monospace;'>{s['snapshot_id']}</td><td>{dt_str}</td><td>{s['operation']}</td><td>{added}</td></tr>"
+
+    # 6. Графики
+    chart_html = ""
+    if history:
+        dates = json.dumps([h['date'] for h in history])
+        rows = json.dumps([h['rows'] for h in history])
+        files = json.dumps([h['files'] for h in history])
+        sizes = json.dumps([h['size_mb'] for h in history])
+
+        chart_html = f"""
+        <h2>📈 Динамика изменений по снапшотам</h2>
+        <div style="display: flex; gap: 20px; margin-bottom: 30px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 300px; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+                <canvas id="rowsChart"></canvas>
+            </div>
+            <div style="flex: 1; min-width: 300px; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+                <canvas id="filesChart"></canvas>
+            </div>
+            <div style="flex: 1; min-width: 300px; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+                <canvas id="sizeChart"></canvas>
+            </div>
+        </div>
+
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script>
+            new Chart(document.getElementById('rowsChart'), {{
+                type: 'line',
+                data: {{ labels: {dates}, datasets: [{{ label: 'Строк', data: {rows}, borderColor: '#16213e', backgroundColor: 'rgba(22, 33, 62, 0.1)', fill: true }}] }},
+                options: {{ responsive: true, plugins: {{ title: {{ display: true, text: 'Рост строк' }} }} }}
+            }});
+            new Chart(document.getElementById('filesChart'), {{
+                type: 'bar',
+                data: {{ labels: {dates}, datasets: [{{ label: 'Файлов', data: {files}, backgroundColor: '#e94560' }}] }},
+                options: {{ responsive: true, plugins: {{ title: {{ display: true, text: 'Количество файлов' }} }} }}
+            }});
+            new Chart(document.getElementById('sizeChart'), {{
+                type: 'line',
+                data: {{ labels: {dates}, datasets: [{{ label: 'Размер (MB)', data: {sizes}, borderColor: '#f5a623', backgroundColor: 'rgba(245, 166, 35, 0.1)', fill: true }}] }},
+                options: {{ responsive: true, plugins: {{ title: {{ display: true, text: 'Размер таблицы (MB)' }} }} }}
+            }});
+        </script>
         """
 
-    # 5. Статистика по колонкам
+    # 7. Статистика по NULL
     cols_html = ""
     if null_stats:
         cols_rows = ""
-        for col, null_count in null_stats.items():
-            cols_rows += f"<tr><td>{col}</td><td>{null_count}</td></tr>"
+        for col_name, null_count in null_stats.items():
+            cols_rows += f"<tr><td>{col_name}</td><td>{null_count}</td></tr>"
         cols_html = f"""
         <h2>📊 Статистика по колонкам (NULL)</h2>
         <table>
@@ -290,28 +385,20 @@ def generate_full_report(table_name, stats: dict, snapshots: list, audit_result:
         <div class="subtitle">Таблица: <strong>{table_name}</strong></div>
 
         {cards_html}
-
         <h2>🏥 Аудит метаданных</h2>
         {issues_html}
-
         <h2>📁 Распределение файлов по размеру</h2>
         {files_dist_html}
 
+        {top_files_html}
+
         {cols_html}
+        {chart_html}
 
         <h2>📸 История снапшотов</h2>
         <table>
-            <thead>
-                <tr>
-                    <th>Snapshot ID</th>
-                    <th>Дата</th>
-                    <th>Операция</th>
-                    <th>Добавлено строк</th>
-                </tr>
-            </thead>
-            <tbody>
-                {snaps_rows}
-            </tbody>
+            <thead><tr><th>Snapshot ID</th><th>Дата</th><th>Операция</th><th>Добавлено строк</th></tr></thead>
+            <tbody>{snaps_rows}</tbody>
         </table>
     </body>
     </html>
