@@ -1,80 +1,264 @@
+import datetime
 from rich.console import Console
 from rich.table import Table
-
 from .drift_detector import DriftDetector
 from pyiceberg.catalog import load_catalog
-import datetime
 
-def get_snapshot_summary(spark, table_name: str):
-    """Собирает базовую статистику по последнему снапшоту."""
-    # Убрали MIN(committed_at), так как в .files этого поля нет
-    summary = spark.sql(f"""
-        SELECT 
-            COUNT(*) as file_count,
-            SUM(file_size_in_bytes) as total_bytes,
-            SUM(record_count) as total_rows
-        FROM {table_name}.files
-    """).collect()[0]
 
-    # Если размер меньше 1 МБ, показываем в КБ
-    total_bytes = summary['total_bytes'] if summary['total_bytes'] else 0
-    if total_bytes > 1024 * 1024:
-        size_str = f"{round(total_bytes / (1024 * 1024), 2)} MB"
+# ==========================================
+# БЛОК 1: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И СТАТИСТИКА
+# ==========================================
+
+def list_snapshots(spark, table_name: str):
+    """
+    Выводит историю снапшотов в виде красивой таблицы.
+    """
+    console = Console()
+    snapshots_df = spark.sql(
+        f"SELECT snapshot_id, committed_at, operation, summary FROM {table_name}.snapshots ORDER BY committed_at ASC")
+    snapshots = snapshots_df.collect()
+
+    table = Table(title=f"📸 История снапшотов: {table_name}")
+    table.add_column("Snapshot ID", style="cyan", no_wrap=True)
+    table.add_column("Дата", style="magenta")
+    table.add_column("Операция", style="green")
+    table.add_column("Добавлено строк", style="yellow")
+
+    for row in snapshots:
+        dt = row['committed_at']
+        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if hasattr(dt, 'strftime') else str(dt)
+
+        # Достаем количество добавленных строк из summary (если есть)
+        added_rows = row['summary'].get('added-records', '—')
+
+        table.add_row(str(row['snapshot_id']), dt_str, row['operation'], str(added_rows))
+
+    console.print("\n")
+    console.print(table)
+    console.print("\n")
+    return snapshots
+
+def get_table_statistics(spark, table_name: str):
+    """
+    Расширенная статистика: файлы, размер, строки, разбивка по размерам.
+    """
+    try:
+        stats = spark.sql(f"""
+            SELECT 
+                COUNT(*) as total_files,
+                SUM(file_size_in_bytes) as total_bytes,
+                SUM(record_count) as total_rows,
+                SUM(CASE WHEN file_size_in_bytes < 1048576 THEN 1 ELSE 0 END) as files_under_1mb,
+                SUM(CASE WHEN file_size_in_bytes >= 1048576 AND file_size_in_bytes < 134217728 THEN 1 ELSE 0 END) as files_1_to_128mb,
+                SUM(CASE WHEN file_size_in_bytes >= 134217728 THEN 1 ELSE 0 END) as files_over_128mb
+            FROM {table_name}.files
+        """).collect()[0]
+
+        total_bytes = stats['total_bytes'] if stats['total_bytes'] else 0
+        size_str = f"{round(total_bytes / (1024 * 1024), 2)} MB" if total_bytes > 1024 * 1024 else f"{round(total_bytes / 1024, 2)} KB"
+
+        return {
+            "total_files": stats['total_files'],
+            "size_str": size_str,
+            "total_rows": stats['total_rows'] if stats['total_rows'] else 0,
+            "file_distribution": {
+                "under_1mb": stats['files_under_1mb'] or 0,
+                "1_to_128mb": stats['files_1_to_128mb'] or 0,
+                "over_128mb": stats['files_over_128mb'] or 0
+            }
+        }
+    except Exception as e:
+        return {"total_files": 0, "size_str": "0 KB", "total_rows": 0, "file_distribution": {}, "error": str(e)}
+
+
+def get_column_null_stats(spark, table_name: str, column_name: str):
+    """
+    Достает статистику по NULL для конкретной колонки из метаданных.
+    """
+    try:
+        table_schema = spark.table(table_name).schema
+        # Находим ID колонки (порядковый номер)
+        field_id = next((idx + 1 for idx, field in enumerate(table_schema.fields) if field.name == column_name), None)
+
+        if field_id is None:
+            return None
+
+        null_stats = spark.sql(f"""
+            SELECT SUM(null_value_counts[{field_id}]) as total_nulls
+            FROM {table_name}.files
+        """).collect()[0]
+
+        return null_stats['total_nulls'] if null_stats['total_nulls'] else 0
+    except Exception:
+        return 0
+
+
+# ==========================================
+# БЛОК 2: АУДИТ ЗДОРОВЬЯ ТАБЛИЦЫ
+# ==========================================
+
+def audit_table_health(spark, table_name: str):
+    """
+    Полный аудит метаданных Iceberg: файлы, снапшоты, манифесты, партиции.
+    Возвращает словарь с результатами и списком проблем.
+    """
+    console = Console()
+    console.print(f"\n[bold cyan]🏥 Аудит здоровья таблицы: {table_name}[/bold cyan]\n")
+
+    issues = []
+    summary_data = {}
+
+    # 1. Аудит файлов (Small Files)
+    try:
+        file_stats = spark.sql(f"""
+            SELECT 
+                COUNT(*) as total_files,
+                SUM(CASE WHEN file_size_in_bytes < 134217728 THEN 1 ELSE 0 END) as small_files,
+                ROUND(AVG(file_size_in_bytes) / 1024 / 1024, 2) as avg_size_mb
+            FROM {table_name}.files
+        """).collect()[0]
+
+        total = file_stats['total_files']
+        small = file_stats['small_files'] or 0
+        avg_size = file_stats['avg_size_mb'] or 0
+
+        summary_data['files'] = {'total': total, 'small': small, 'avg_mb': avg_size}
+
+        table_files = Table(title="📁 Файлы данных")
+        table_files.add_column("Метрика", style="cyan")
+        table_files.add_column("Значение", style="magenta")
+        table_files.add_row("Всего файлов", str(total))
+        table_files.add_row("Мелких (<128MB)", str(small))
+        table_files.add_row("Средний размер (MB)", str(avg_size))
+        console.print(table_files)
+
+        if total > 0 and (small / total) > 0.5:
+            issues.append("⚠️ Много мелких файлов. Рекомендуется `rewrite_data_files`.")
+    except Exception as e:
+        console.print(f"[red]Ошибка аудита файлов: {e}[/red]")
+
+    # 2. Аудит снапшотов
+    try:
+        snap_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {table_name}.snapshots").collect()[0]['cnt']
+        summary_data['snapshots'] = snap_count
+
+        table_snaps = Table(title="📸 Снапшоты")
+        table_snaps.add_column("Метрика", style="cyan")
+        table_snaps.add_column("Значение", style="magenta")
+        table_snaps.add_row("Всего снапшотов", str(snap_count))
+        console.print(table_snaps)
+
+        if snap_count > 100:
+            issues.append("⚠️ Слишком много снапшотов. Рекомендуется `expire_snapshots`.")
+    except Exception as e:
+        console.print(f"[red]Ошибка аудита снапшотов: {e}[/red]")
+
+    # 3. Аудит манифестов
+    try:
+        manifest_count = spark.sql(f"SELECT COUNT(*) as cnt FROM {table_name}.manifests").collect()[0]['cnt']
+        summary_data['manifests'] = manifest_count
+
+        table_manifests = Table(title="📜 Манифесты")
+        table_manifests.add_column("Метрика", style="cyan")
+        table_manifests.add_column("Значение", style="magenta")
+        table_manifests.add_row("Всего манифестов", str(manifest_count))
+        console.print(table_manifests)
+
+        if manifest_count > 50:
+            issues.append("⚠️ Слишком много манифестов. Рекомендуется `rewrite_manifests`.")
+    except Exception as e:
+        console.print(f"[red]Ошибка аудита манифестов: {e}[/red]")
+
+    # Итоговый вердикт
+    console.print("\n[bold]Вердикт:[/bold]")
+    if issues:
+        for issue in issues:
+            console.print(f"[yellow]{issue}[/yellow]")
     else:
-        size_str = f"{round(total_bytes / 1024, 2)} KB"
+        console.print("[green]✅ Таблица здорова. Проблем с метаданными не обнаружено.[/green]")
 
-    return {
-        "file_count": summary['file_count'],
-        "size_str": size_str,
-        "total_rows": summary['total_rows'] if summary['total_rows'] else 0
-    }
+    return {"issues": issues, "summary": summary_data}
 
-def generate_dashboard(results: list, snapshot_summary: dict = None, filename: str = "drift_dashboard.html"):
-    rows = ""
-    for r in results:
-        status_color = "#f8d7da" if r.get('is_drift') else "#d4edda"
-        status_text = "🚨 Дрейф" if r.get('is_drift') else "✅ Стабильно"
 
-        # Формируем детали
-        details = ""
-        if r.get('type') == 'numeric':
-            details = f"Среднее: {r.get('mean_prev', 0):.2f} -> {r.get('mean_curr', 0):.2f}"
-        elif r.get('type') == 'categorical':
-            details = "Распределение изменилось" if r.get('is_drift') else "Без изменений"
-        elif r.get('type') == 'null_count_zero_scan':
-            details = f"NULL: {r.get('nulls_prev')} -> {r.get('nulls_curr')}"
-        elif r.get('type') == 'bounds_zero_scan':
-            details = f"Min: {r.get('min_prev')} -> {r.get('min_curr')}, Max: {r.get('max_prev')} -> {r.get('max_curr')}"
+# ==========================================
+# БЛОК 3: ГЕНЕРАЦИЯ HTML-ОТЧЕТА
+# ==========================================
+def generate_full_report(table_name, stats: dict, snapshots: list, audit_result: dict, null_stats: dict = None,
+                         filename: str = "report.html"):
+    """
+    Генерирует детальный HTML-отчет со всей статистикой, историей и аудитом.
+    """
+    # 1. Блок карточек с общей статистикой
+    cards_html = f"""
+    <div class="summary-cards">
+        <div class="card">
+            <div class="card-value">{stats.get('total_files', 0)}</div>
+            <div class="card-label">Файлов</div>
+        </div>
+        <div class="card">
+            <div class="card-value">{stats.get('size_str', '0')}</div>
+            <div class="card-label">Размер</div>
+        </div>
+        <div class="card">
+            <div class="card-value">{stats.get('total_rows', 0):,}</div>
+            <div class="card-label">Строк</div>
+        </div>
+        <div class="card">
+            <div class="card-value">{audit_result['summary'].get('snapshots', 0)}</div>
+            <div class="card-label">Снапшотов</div>
+        </div>
+    </div>
+    """
 
-        p_val = f"{r.get('p_value', 0):.4f}" if r.get('p_value') is not None else "—"
+    # 2. Блок проблем
+    if audit_result['issues']:
+        issues_html = "<ul class='issues-list'>"
+        for issue in audit_result['issues']:
+            issues_html += f"<li class='issue-item'>{issue}</li>"
+        issues_html += "</ul>"
+    else:
+        issues_html = "<p class='success'>✅ Таблица здорова. Проблем не обнаружено.</p>"
 
-        rows += f"""
+    # 3. Детализация по файлам (распределение размеров)
+    dist = stats.get('file_distribution', {})
+    files_dist_html = f"""
+    <table>
+        <thead><tr><th>Категория размера</th><th>Количество файлов</th><th>Статус</th></tr></thead>
+        <tbody>
+            <tr><td>Меньше 1 МБ</td><td>{dist.get('under_1mb', 0)}</td><td>{'⚠️ Много мелких' if dist.get('under_1mb', 0) > 10 else '✅ ОК'}</td></tr>
+            <tr><td>1 МБ - 128 МБ</td><td>{dist.get('1_to_128mb', 0)}</td><td>✅ ОК</td></tr>
+            <tr><td>Больше 128 МБ</td><td>{dist.get('over_128mb', 0)}</td><td>✅ Оптимально</td></tr>
+        </tbody>
+    </table>
+    """
+
+    # 4. История снапшотов
+    snaps_rows = ""
+    for s in snapshots:
+        dt_str = s['committed_at'].strftime("%Y-%m-%d %H:%M:%S") if hasattr(s['committed_at'], 'strftime') else str(
+            s['committed_at'])
+        added = s['summary'].get('added-records', '—')
+        snaps_rows += f"""
         <tr>
-            <td><strong>{r['column']}</strong></td>
-            <td>{r['type']}</td>
-            <td>{p_val}</td>
-            <td>{details}</td>
-            <td style="background-color: {status_color}; font-weight: bold; text-align: center;">{status_text}</td>
+            <td style="font-family: monospace;">{s['snapshot_id']}</td>
+            <td>{dt_str}</td>
+            <td>{s['operation']}</td>
+            <td>{added}</td>
         </tr>
         """
 
-    summary_html = ""
-    if snapshot_summary:
-        summary_html = f"""
-        <div class="summary-cards">
-            <div class="card">
-                <div class="card-value">{snapshot_summary['file_count']}</div>
-                <div class="card-label">Файлов</div>
-            </div>
-            <div class="card">
-                <div class="card-value">{snapshot_summary['size_str']}</div>
-                <div class="card-label">Общий размер</div>
-            </div>
-            <div class="card">
-                <div class="card-value">{snapshot_summary['total_rows']:,}</div>
-                <div class="card-label">Строк</div>
-            </div>
-        </div>
+    # 5. Статистика по колонкам
+    cols_html = ""
+    if null_stats:
+        cols_rows = ""
+        for col, null_count in null_stats.items():
+            cols_rows += f"<tr><td>{col}</td><td>{null_count}</td></tr>"
+        cols_html = f"""
+        <h2>📊 Статистика по колонкам (NULL)</h2>
+        <table>
+            <thead><tr><th>Колонка</th><th>Количество NULL</th></tr></thead>
+            <tbody>{cols_rows}</tbody>
+        </table>
         """
 
     html_content = f"""
@@ -82,40 +266,51 @@ def generate_dashboard(results: list, snapshot_summary: dict = None, filename: s
     <html lang="ru">
     <head>
         <meta charset="UTF-8">
-        <title>Drift Dashboard</title>
+        <title>Iceberg Table Report</title>
         <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background-color: #f0f2f5; }}
-            h1 {{ color: #1a1a2e; margin-bottom: 10px; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background-color: #f0f2f5; color: #333; }}
+            h1 {{ color: #1a1a2e; margin-bottom: 5px; }}
+            h2 {{ color: #16213e; margin-top: 40px; border-bottom: 2px solid #ddd; padding-bottom: 10px; }}
             .subtitle {{ color: #666; margin-bottom: 30px; }}
             .summary-cards {{ display: flex; gap: 20px; margin-bottom: 30px; }}
             .card {{ background: white; padding: 20px 30px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); text-align: center; flex: 1; max-width: 200px; }}
             .card-value {{ font-size: 28px; font-weight: bold; color: #16213e; }}
             .card-label {{ font-size: 13px; color: #888; margin-top: 5px; text-transform: uppercase; letter-spacing: 0.5px; }}
-            table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+            .issues-list {{ list-style: none; padding: 0; }}
+            .issue-item {{ background: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; margin-bottom: 10px; border-left: 5px solid #ffeeba; }}
+            .success {{ background: #d4edda; color: #155724; padding: 15px; border-radius: 8px; border-left: 5px solid #c3e6cb; }}
+            table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); margin-top: 15px; }}
             th {{ background-color: #16213e; color: white; padding: 14px; text-align: left; font-weight: 500; }}
-            td {{ padding: 14px; border-bottom: 1px solid #eee; vertical-align: top; }}
-            tr:last-child td {{ border-bottom: none; }}
+            td {{ padding: 14px; border-bottom: 1px solid #eee; }}
             tr:hover {{ background-color: #f8f9fa; }}
         </style>
     </head>
     <body>
-        <h1>🔍 Drift Detection Dashboard</h1>
-        <div class="subtitle">Результаты zero-scan и сканирующих проверок</div>
+        <h1>🧊 Iceberg Table Report</h1>
+        <div class="subtitle">Таблица: <strong>{table_name}</strong></div>
 
-        {summary_html}
+        {cards_html}
 
+        <h2>🏥 Аудит метаданных</h2>
+        {issues_html}
+
+        <h2>📁 Распределение файлов по размеру</h2>
+        {files_dist_html}
+
+        {cols_html}
+
+        <h2>📸 История снапшотов</h2>
         <table>
             <thead>
                 <tr>
-                    <th>Колонка</th>
-                    <th>Тип проверки</th>
-                    <th>p-value</th>
-                    <th>Детали</th>
-                    <th>Статус</th>
+                    <th>Snapshot ID</th>
+                    <th>Дата</th>
+                    <th>Операция</th>
+                    <th>Добавлено строк</th>
                 </tr>
             </thead>
             <tbody>
-                {rows}
+                {snaps_rows}
             </tbody>
         </table>
     </body>
@@ -124,384 +319,4 @@ def generate_dashboard(results: list, snapshot_summary: dict = None, filename: s
 
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(html_content)
-    print(f"\nДашборд сохранен: {filename}")
-
-def list_snapshots(spark, table_name: str):
-    """
-    Выводит список всех снапшотов таблицы Iceberg в виде красивой таблицы.
-    """
-    snapshots_df = spark.sql(
-        f"SELECT snapshot_id, committed_at, operation FROM {table_name}.snapshots ORDER BY committed_at ASC")
-    snapshots = snapshots_df.collect()
-
-    console = Console()
-    table = Table(title=f"История снапшотов: {table_name}")
-
-    table.add_column("Snapshot ID", style="cyan", no_wrap=True)
-    table.add_column("Дата создания", style="magenta")
-    table.add_column("Операция", style="green")
-
-    for row in snapshots:
-        dt = row['committed_at']
-        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if hasattr(dt, 'strftime') else str(dt)
-        table.add_row(str(row['snapshot_id']), dt_str, row['operation'])
-
-    console.print("\n")
-    console.print(table)
-    console.print("\n")
-    return snapshots
-
-
-def check_table_drift(
-        catalog_name: str,
-        table_name: str,
-        column_name: str,
-        threshold: float = 0.05,
-        snapshot_id_from: int = None,
-        snapshot_id_to: int = None,
-        **catalog_kwargs
-):
-    """
-    Проверка дрейфа с использованием PyIceberg.
-    """
-    catalog = load_catalog(catalog_name, **catalog_kwargs)
-    if "." not in table_name:
-        table_name = f"default.{table_name}"
-
-    table = catalog.load_table(table_name)
-    snapshots = table.metadata.snapshots
-
-    if len(snapshots) < 2:
-        raise ValueError("В таблице меньше двух снапшотов.")
-
-    # Логика выбора снапшотов
-    if snapshot_id_from and snapshot_id_to:
-        first_snapshot = next((s for s in snapshots if s.snapshot_id == snapshot_id_from), None)
-        last_snapshot = next((s for s in snapshots if s.snapshot_id == snapshot_id_to), None)
-        if not first_snapshot or not last_snapshot:
-            raise ValueError("Указанные ID снапшотов не найдены в таблице.")
-    else:
-        # По умолчанию: первый и последний
-        first_snapshot = snapshots[0]
-        last_snapshot = snapshots[-1]
-
-    df_first = table.scan(snapshot_id=first_snapshot.snapshot_id).to_pandas()
-    df_last = table.scan(snapshot_id=last_snapshot.snapshot_id).to_pandas()
-
-    detector = DriftDetector(df_first, df_last)
-    return detector.analyze_numeric_drift(column_name, threshold)
-
-
-# ... (начало файла без изменений, импорты) ...
-
-def check_table_drift_spark(
-        spark,
-        table_name: str,
-        column_name: str,
-        threshold: float = 0.05,
-        sample_limit: int = 100000,
-        snapshot_id_from: int = None,
-        snapshot_id_to: int = None
-):
-    """
-    Проверка дрейфа для таблицы Iceberg через Spark.
-    Автоматически определяет тип колонки (числовая или категориальная).
-    """
-    snapshots_df = spark.sql(f"SELECT snapshot_id, committed_at FROM {table_name}.snapshots ORDER BY committed_at ASC")
-    snapshots = snapshots_df.collect()
-
-    if len(snapshots) < 2:
-        raise ValueError("В таблице меньше двух снапшотов.")
-
-    if snapshot_id_from is not None and snapshot_id_to is not None:
-        first_snapshot_id = int(snapshot_id_from)
-        last_snapshot_id = int(snapshot_id_to)
-        existing_ids = [row['snapshot_id'] for row in snapshots]
-        if first_snapshot_id not in existing_ids or last_snapshot_id not in existing_ids:
-            raise ValueError(f"Указанные ID снапшотов не найдены.")
-    else:
-        first_snapshot_id = snapshots[0]['snapshot_id']
-        last_snapshot_id = snapshots[-1]['snapshot_id']
-
-    df_first = spark.read.format("iceberg").option("snapshot-id", first_snapshot_id).load(table_name)
-    df_last = spark.read.format("iceberg").option("snapshot-id", last_snapshot_id).load(table_name)
-
-    # --- НОВАЯ ЛОГИКА: Определение типа колонки ---
-    # Получаем тип данных из схемы Spark
-    col_type = dict(df_first.dtypes)[column_name]
-    is_numeric = col_type in ('int', 'bigint', 'double', 'float', 'decimal')
-
-    print(f"Извлечение до {sample_limit} строк для анализа (Тип колонки: {col_type})...")
-    pdf_first = df_first.select(column_name).limit(sample_limit).toPandas()
-    pdf_last = df_last.select(column_name).limit(sample_limit).toPandas()
-
-    detector = DriftDetector(pdf_first, pdf_last)
-
-    # Выбираем метод в зависимости от типа
-    if is_numeric:
-        return detector.analyze_numeric_drift(column_name, threshold)
-    else:
-        return detector.analyze_categorical_drift(column_name, threshold)
-
-
-def generate_html_report(result: dict, filename: str = "drift_report.html"):
-    """
-    Генерирует HTML-отчет (поддерживает и числа, и строки).
-    """
-    # Если передан список (результаты по всем колонкам)
-    if isinstance(result, list):
-        rows = ""
-        for r in result:
-            status_color = "#f8d7da" if r.get('is_drift') else "#d4edda"
-            status_text = "🚨 Дрейф" if r.get('is_drift') else "✅ Стабильно"
-
-            # Для чисел показываем среднее, для строк — просто статистику
-            extra = f"Среднее: {r.get('mean_prev', 0):.2f} -> {r.get('mean_curr', 0):.2f}" if r.get(
-                'type') == 'numeric' else ""
-
-            rows += f"""
-            <tr>
-                <td><strong>{r['column']}</strong></td>
-                <td>{r['type']}</td>
-                <td>{r['p_value']:.4f}</td>
-                <td>{extra}</td>
-                <td style="background-color: {status_color}; font-weight: bold;">{status_text}</td>
-            </tr>
-            """
-
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="ru">
-        <head>
-            <meta charset="UTF-8">
-            <title>Отчет о дрейфе данных</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 40px; background-color: #f4f4f9; }}
-                table {{ width: 100%; border-collapse: collapse; background: white; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-                th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-                th {{ background-color: #f8f9fa; }}
-                h1 {{ color: #333; }}
-            </style>
-        </head>
-        <body>
-            <h1>Сводный отчет о дрейфе данных</h1>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Колонка</th>
-                        <th>Тип</th>
-                        <th>p-value</th>
-                        <th>Детали</th>
-                        <th>Статус</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {rows}
-                </tbody>
-            </table>
-        </body>
-        </html>
-        """
-    else:
-        # Одиночный результат (как было раньше)
-        html_content = f"""
-        <!DOCTYPE html>
-        <html lang="ru">
-        <head>
-            <meta charset="UTF-8">
-            <title>Отчет о дрейфе</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 40px; background-color: #f4f4f9; }}
-                .card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 600px; }}
-                .alert {{ padding: 15px; border-radius: 5px; font-weight: bold; text-align: center; margin-top: 20px; }}
-                .alert-danger {{ background-color: #f8d7da; color: #721c24; }}
-                .alert-success {{ background-color: #d4edda; color: #155724; }}
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <h1>Отчет о дрейфе данных</h1>
-                <p><strong>Колонка:</strong> {result.get('column')}</p>
-                <p><strong>Тип:</strong> {result.get('type')}</p>
-                <p><strong>p-value:</strong> {result.get('p_value', 0):.4f}</p>
-                <div class="alert {'alert-danger' if result.get('is_drift') else 'alert-success'}">
-                    {'🚨 ОБНАРУЖЕН ДРЕЙФ!' if result.get('is_drift') else '✅ Дрейф не обнаружен.'}
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(html_content)
-    print(f"\nHTML-отчет сохранен: {filename}")
-
-
-def analyze_table_drift(
-        spark,
-        table_name: str,
-        threshold: float = 0.05,
-        sample_limit: int = 100000,
-        snapshot_id_from: int = None,
-        snapshot_id_to: int = None
-):
-    """
-    Анализирует дрейф по всем колонкам таблицы.
-    Возвращает список результатов.
-    """
-    # Получаем схему таблицы
-    df_sample = spark.read.format("iceberg").load(table_name).limit(1)
-    columns = df_sample.columns
-
-    results = []
-    print(f"\n--- Анализ дрейфа по {len(columns)} колонкам ---")
-
-    for col in columns:
-        try:
-            # Вызываем нашу функцию для каждой колонки
-            res = check_table_drift_spark(
-                spark=spark,
-                table_name=table_name,
-                column_name=col,
-                threshold=threshold,
-                sample_limit=sample_limit,
-                snapshot_id_from=snapshot_id_from,
-                snapshot_id_to=snapshot_id_to
-            )
-            # Добавляем в результат
-            if "error" not in res:
-                results.append(res)
-                status = "🚨 Дрейф" if res['is_drift'] else "✅ Стабильно"
-                print(f"  {col} ({res['type']}): {status} (p-value: {res['p_value']:.4f})")
-        except Exception as e:
-            print(f"  {col}: Ошибка - {e}")
-
-    return results
-
-
-def check_null_drift_zero_scan(
-        spark,
-        table_name: str,
-        column_name: str,
-        threshold: float = 0.05,
-        snapshot_id_from: int = None,
-        snapshot_id_to: int = None
-):
-    """
-    Zero-Scan проверка дрейфа null_count между двумя снапшотами.
-    Не читает данные, только метаданные файлов (манифесты).
-    """
-    # 1. Получаем список снапшотов
-    snapshots_df = spark.sql(f"SELECT snapshot_id, committed_at FROM {table_name}.snapshots ORDER BY committed_at ASC")
-    snapshots = snapshots_df.collect()
-
-    if len(snapshots) < 2:
-        raise ValueError("В таблице меньше двух снапшотов.")
-
-    # Выбор снапшотов
-    if snapshot_id_from is not None and snapshot_id_to is not None:
-        first_id = int(snapshot_id_from)
-        last_id = int(snapshot_id_to)
-    else:
-        first_id = snapshots[0]['snapshot_id']
-        last_id = snapshots[-1]['snapshot_id']
-
-    # 2. Функция для получения суммарного null_count для колонки в снапшоте
-    def get_null_count(snapshot_id):
-        # Читаем .files для нужного снапшота
-        files_df = spark.read.format("iceberg") \
-            .option("snapshot-id", snapshot_id) \
-            .load(f"{table_name}.files")
-
-        files_df.createOrReplaceTempView("current_files")
-
-        # Определяем числовой ID колонки (порядковый номер + 1)
-        table_schema = spark.table(table_name).schema
-        field_id = None
-        for idx, field in enumerate(table_schema.fields):
-            if field.name == column_name:
-                # Пытаемся взять из метаданных, иначе используем индекс+1
-                field_id = field.metadata.get("iceberg.field.id", idx + 1)
-                break
-
-        if field_id is None:
-            raise ValueError(f"Колонка {column_name} не найдена")
-
-        # Суммируем null_value_counts по всем файлам
-        # Используем числовой ID как ключ
-        null_count_df = spark.sql(f"""
-            SELECT SUM(null_value_counts[{field_id}]) as total_nulls
-            FROM current_files
-            WHERE null_value_counts[{field_id}] IS NOT NULL
-        """)
-
-        result = null_count_df.collect()[0]['total_nulls']
-        return result if result is not None else 0
-
-    # 3. Получаем null_count для обоих снапшотов
-    nulls_first = get_null_count(first_id)
-    nulls_last = get_null_count(last_id)
-
-    # 4. Простая логика дрейфа: если количество null выросло более чем на threshold (в процентах)
-    # или изменилось существенно, считаем это дрейфом
-    if nulls_first == 0 and nulls_last > 0:
-        is_drift = True
-        change_pct = float('inf')
-    elif nulls_first > 0:
-        change_pct = abs(nulls_last - nulls_first) / nulls_first
-        is_drift = change_pct > threshold
-    else:
-        change_pct = 0.0
-        is_drift = False
-
-    return {
-        "column": column_name,
-        "type": "null_count_zero_scan",
-        "nulls_prev": int(nulls_first),
-        "nulls_curr": int(nulls_last),
-        "change_pct": float(change_pct) if change_pct != float('inf') else "inf",
-        "is_drift": is_drift,
-        "p_value": None,  # Для zero-scan нет p-value, есть только изменение
-        "stat": None
-    }
-
-
-def check_bounds_drift_zero_scan(spark, table_name: str, column_name: str, threshold_pct: float = 0.5, **kwargs):
-    snapshots_df = spark.sql(f"SELECT snapshot_id FROM {table_name}.snapshots ORDER BY committed_at ASC")
-    snapshots = snapshots_df.collect()
-    first_id, last_id = snapshots[0]['snapshot_id'], snapshots[-1]['snapshot_id']
-
-    def get_bounds(snapshot_id):
-        files_df = spark.read.format("iceberg").option("snapshot-id", snapshot_id).load(f"{table_name}.files")
-        files_df.createOrReplaceTempView("current_files_bounds")
-
-        # Получаем ID колонки
-        table_schema = spark.table(table_name).schema
-        field_id = next((idx + 1 for idx, field in enumerate(table_schema.fields) if field.name == column_name), None)
-
-        if field_id is None:
-            raise ValueError(f"Колонка {column_name} не найдена")
-
-        # Берем HEX-представление границ
-        res = spark.sql(f"""
-            SELECT 
-                MIN(HEX(lower_bounds[{field_id}])) as min_hex,
-                MAX(HEX(upper_bounds[{field_id}])) as max_hex
-            FROM current_files_bounds
-        """).collect()[0]
-
-        return res['min_hex'], res['max_hex']
-
-    min_prev, max_prev = get_bounds(first_id)
-    min_curr, max_curr = get_bounds(last_id)
-
-    is_drift = (min_prev != min_curr) or (max_prev != max_curr)
-
-    return {
-        "column": column_name,
-        "type": "bounds_zero_scan",
-        "min_prev": min_prev, "min_curr": min_curr,
-        "max_prev": max_prev, "max_curr": max_curr,
-        "is_drift": is_drift,
-        "details": "Границы изменились (HEX)" if is_drift else "Без изменений"
-    }
+    print(f"\n📄 Полный отчет сохранен в файл: {filename}")
